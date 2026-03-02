@@ -1,0 +1,144 @@
+#!/bin/bash
+# claude-token-log — Run Claude Code and log token usage to JSONL
+#
+# Wraps `claude --output-format json`, captures the JSON response,
+# extracts token metrics, and appends a usage record to a JSONL file.
+# Passes through all claude arguments transparently.
+#
+# Usage:
+#   claude-token-log [options] [-- claude-args...]
+#   claude-token-log -p "your prompt"
+#   claude-token-log --tag "my-job" --log ./usage.jsonl -- --model claude-opus-4-6 -p "hello"
+#
+# Options:
+#   --log <path>    JSONL output file (default: ./token_usage.jsonl)
+#   --tag <label>   Free-form label to tag this session (default: "")
+#   --keep-json     Keep the raw JSON output file (default: delete after extraction)
+#   --quiet         Don't print the usage summary line to stderr
+#   -h, --help      Show this help
+#
+# All other arguments are passed directly to `claude`.
+# The `--output-format json` flag is added automatically.
+#
+# Output JSONL record fields:
+#   timestamp, tag, input_tokens, output_tokens, cache_creation,
+#   cache_read, cost_usd, duration_ms, num_turns, model, exit_code
+#
+# Examples:
+#   claude-token-log -p "explain this code"
+#   claude-token-log --tag "batch-42" --log /tmp/usage.jsonl -- --model claude-opus-4-6 -p "hello"
+#   claude-token-log --keep-json -- --dangerously-skip-permissions -p "refactor"
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# Defaults
+LOG_FILE="${CLAUDE_TOKEN_LOG:-./token_usage.jsonl}"
+TAG=""
+KEEP_JSON=false
+QUIET=false
+CLAUDE_ARGS=()
+
+usage() {
+    sed -n '2,/^$/s/^# //p' "$0"
+    exit 0
+}
+
+# Parse our options (everything before --)
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --log)       LOG_FILE="$2"; shift 2 ;;
+        --tag)       TAG="$2"; shift 2 ;;
+        --keep-json) KEEP_JSON=true; shift ;;
+        --quiet)     QUIET=true; shift ;;
+        -h|--help)   usage ;;
+        -v|--version) echo "claude-token-log $VERSION"; exit 0 ;;
+        --)          shift; CLAUDE_ARGS+=("$@"); break ;;
+        *)           CLAUDE_ARGS+=("$1"); shift ;;
+    esac
+done
+
+# Ensure claude is available
+command -v claude &>/dev/null || { echo "ERROR: claude not found in PATH" >&2; exit 1; }
+command -v jq &>/dev/null || { echo "ERROR: jq is required (brew install jq)" >&2; exit 1; }
+
+# Check if --output-format is already in args (don't add twice)
+HAS_OUTPUT_FORMAT=false
+for arg in "${CLAUDE_ARGS[@]}"; do
+    if [[ "$arg" == "--output-format" ]]; then
+        HAS_OUTPUT_FORMAT=true
+        break
+    fi
+done
+
+if ! $HAS_OUTPUT_FORMAT; then
+    CLAUDE_ARGS=("--output-format" "json" "${CLAUDE_ARGS[@]}")
+fi
+
+# Temp file for JSON output
+JSON_FILE=$(mktemp "${TMPDIR:-/tmp}/claude-token-XXXXXX.json")
+trap 'if ! $KEEP_JSON; then rm -f "$JSON_FILE"; fi' EXIT
+
+# Run claude
+SESSION_START=$(date +%s)
+EXIT_CODE=0
+
+claude "${CLAUDE_ARGS[@]}" > "$JSON_FILE" 2>&1 || EXIT_CODE=$?
+
+SESSION_END=$(date +%s)
+SESSION_DURATION=$((SESSION_END - SESSION_START))
+
+# Check if output is valid JSON
+if ! jq -e '.' "$JSON_FILE" > /dev/null 2>&1; then
+    if ! $QUIET; then
+        echo "[token-log] Session output was not valid JSON (exit code: $EXIT_CODE)" >&2
+        echo "[token-log] Raw output saved: $JSON_FILE" >&2
+    fi
+    # Still try to write a minimal record
+    TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    echo "{\"timestamp\":\"$TIMESTAMP\",\"tag\":\"$TAG\",\"input_tokens\":0,\"output_tokens\":0,\"cache_creation\":0,\"cache_read\":0,\"cost_usd\":0,\"duration_ms\":$((SESSION_DURATION * 1000)),\"num_turns\":0,\"model\":\"unknown\",\"exit_code\":$EXIT_CODE,\"error\":\"invalid_json\"}" >> "$LOG_FILE"
+    KEEP_JSON=true  # Don't delete — useful for debugging
+    exit $EXIT_CODE
+fi
+
+# Print the actual result to stdout (so callers can still use the output)
+jq -r '.result // empty' "$JSON_FILE" 2>/dev/null
+
+# Extract and append token usage
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+jq -c --arg ts "$TIMESTAMP" \
+      --arg tag "$TAG" \
+      --arg dur "$SESSION_DURATION" \
+      --argjson exit_code "$EXIT_CODE" \
+    '{
+        timestamp: $ts,
+        tag: $tag,
+        input_tokens: (.usage.input_tokens // 0),
+        output_tokens: (.usage.output_tokens // 0),
+        cache_creation: (.usage.cache_creation_input_tokens // 0),
+        cache_read: (.usage.cache_read_input_tokens // 0),
+        cost_usd: (.total_cost_usd // 0),
+        duration_ms: (.duration_ms // ($dur | tonumber * 1000)),
+        num_turns: (.num_turns // 0),
+        model: (.model // "unknown"),
+        exit_code: $exit_code
+    }' "$JSON_FILE" >> "$LOG_FILE" 2>/dev/null
+
+if [[ $? -eq 0 ]] && ! $QUIET; then
+    # Print summary to stderr
+    COST=$(jq -r '.total_cost_usd // "?"' "$JSON_FILE" 2>/dev/null)
+    IN_TOK=$(jq -r '.usage.input_tokens // 0' "$JSON_FILE" 2>/dev/null)
+    OUT_TOK=$(jq -r '.usage.output_tokens // 0' "$JSON_FILE" 2>/dev/null)
+    TURNS=$(jq -r '.num_turns // 0' "$JSON_FILE" 2>/dev/null)
+    echo "[token-log] ${IN_TOK} in + ${OUT_TOK} out | ${TURNS} turns | \$${COST} | ${SESSION_DURATION}s → ${LOG_FILE}" >&2
+elif ! $QUIET; then
+    echo "[token-log] Could not extract token usage from session output" >&2
+fi
+
+if $KEEP_JSON; then
+    echo "[token-log] Raw JSON: $JSON_FILE" >&2
+fi
+
+exit $EXIT_CODE

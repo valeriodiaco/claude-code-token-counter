@@ -1,0 +1,260 @@
+#!/bin/bash
+# claude-token-report — Analyze token usage from JSONL logs
+#
+# Reads token_usage.jsonl files produced by claude-token-log and
+# generates usage summaries, cost reports, and per-tag breakdowns.
+#
+# Usage:
+#   claude-token-report [options] [file...]
+#   claude-token-report
+#   claude-token-report --tag "batch-42" --since "2026-03-01"
+#   claude-token-report --format csv /path/to/token_usage.jsonl
+#
+# Options:
+#   --tag <label>     Filter by tag
+#   --since <date>    Only include records after this ISO date
+#   --until <date>    Only include records before this ISO date
+#   --format <fmt>    Output format: table (default), csv, json
+#   --by-tag          Group and subtotal by tag
+#   --by-day          Group and subtotal by day
+#   --by-model        Group and subtotal by model
+#   -h, --help        Show this help
+#
+# If no file is specified, reads ./token_usage.jsonl
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# Defaults
+FILES=()
+TAG_FILTER=""
+SINCE=""
+UNTIL=""
+FORMAT="table"
+GROUP_BY=""
+
+# Colors
+BOLD='\033[1m'
+DIM='\033[2m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+usage() {
+    sed -n '2,/^$/s/^# //p' "$0"
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --tag)      TAG_FILTER="$2"; shift 2 ;;
+        --since)    SINCE="$2"; shift 2 ;;
+        --until)    UNTIL="$2"; shift 2 ;;
+        --format)   FORMAT="$2"; shift 2 ;;
+        --by-tag)   GROUP_BY="tag"; shift ;;
+        --by-day)   GROUP_BY="day"; shift ;;
+        --by-model) GROUP_BY="model"; shift ;;
+        -h|--help)  usage ;;
+        -v|--version) echo "claude-token-report $VERSION"; exit 0 ;;
+        *)          FILES+=("$1"); shift ;;
+    esac
+done
+
+command -v python3 &>/dev/null || { echo "ERROR: python3 is required" >&2; exit 1; }
+
+# Default file
+if [[ ${#FILES[@]} -eq 0 ]]; then
+    DEFAULT_FILE="${CLAUDE_TOKEN_LOG:-./token_usage.jsonl}"
+    if [[ -f "$DEFAULT_FILE" ]]; then
+        FILES=("$DEFAULT_FILE")
+    else
+        echo "ERROR: No JSONL file found. Specify a file or set CLAUDE_TOKEN_LOG." >&2
+        exit 1
+    fi
+fi
+
+# Validate files exist
+for f in "${FILES[@]}"; do
+    if [[ ! -f "$f" ]]; then
+        echo "ERROR: File not found: $f" >&2
+        exit 1
+    fi
+done
+
+# Combine all files
+COMBINED=$(cat "${FILES[@]}")
+
+python3 -c "
+import json, sys
+from datetime import datetime, timezone
+from collections import defaultdict
+
+lines = '''$COMBINED'''.strip().split('\n')
+tag_filter = '$TAG_FILTER'
+since = '$SINCE'
+until_d = '$UNTIL'
+fmt = '$FORMAT'
+group_by = '$GROUP_BY'
+
+records = []
+parse_errors = 0
+
+for line in lines:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        r = json.loads(line)
+    except:
+        parse_errors += 1
+        continue
+
+    # Apply filters
+    if tag_filter and r.get('tag', '') != tag_filter:
+        continue
+    if since and r.get('timestamp', '') < since:
+        continue
+    if until_d and r.get('timestamp', '') > until_d:
+        continue
+
+    records.append(r)
+
+if not records:
+    print('No matching records found.', file=sys.stderr)
+    sys.exit(0)
+
+def fmt_number(n):
+    if n >= 1_000_000:
+        return f'{n/1_000_000:.1f}M'
+    elif n >= 1_000:
+        return f'{n/1_000:.1f}K'
+    return str(n)
+
+def fmt_cost(c):
+    if c >= 1:
+        return f'\${c:.2f}'
+    return f'\${c:.4f}'
+
+def fmt_duration(ms):
+    secs = ms / 1000
+    if secs >= 3600:
+        return f'{secs/3600:.1f}h'
+    elif secs >= 60:
+        return f'{secs/60:.0f}m'
+    return f'{secs:.0f}s'
+
+def summarize(recs, label=''):
+    total_in = sum(r.get('input_tokens', 0) for r in recs)
+    total_out = sum(r.get('output_tokens', 0) for r in recs)
+    total_cache_create = sum(r.get('cache_creation', 0) for r in recs)
+    total_cache_read = sum(r.get('cache_read', 0) for r in recs)
+    total_cost = sum(r.get('cost_usd', 0) for r in recs)
+    total_duration = sum(r.get('duration_ms', 0) for r in recs)
+    total_turns = sum(r.get('num_turns', 0) for r in recs)
+    sessions = len(recs)
+    errors = sum(1 for r in recs if r.get('exit_code', 0) != 0 or r.get('error'))
+
+    return {
+        'label': label,
+        'sessions': sessions,
+        'input_tokens': total_in,
+        'output_tokens': total_out,
+        'cache_creation': total_cache_create,
+        'cache_read': total_cache_read,
+        'total_tokens': total_in + total_out,
+        'cost_usd': total_cost,
+        'duration_ms': total_duration,
+        'turns': total_turns,
+        'errors': errors,
+        'avg_tokens_per_session': (total_in + total_out) // max(1, sessions),
+        'avg_cost_per_session': total_cost / max(1, sessions),
+    }
+
+def print_table(summaries):
+    print()
+    print(f'\033[1m  {\"GROUP\":<20} {\"SESSIONS\":>8} {\"INPUT\":>10} {\"OUTPUT\":>10} {\"CACHE R\":>10} {\"COST\":>10} {\"DURATION\":>10} {\"TURNS\":>7}\033[0m')
+    print('  ' + '-' * 90)
+
+    for s in summaries:
+        label = s['label'] or 'total'
+        sess = s['sessions']
+        err_suffix = f' \033[0;31m({s[\"errors\"]} err)\033[0m' if s['errors'] else ''
+
+        print(f'  {label:<20} {sess:>8}{err_suffix} {fmt_number(s[\"input_tokens\"]):>10} {fmt_number(s[\"output_tokens\"]):>10} {fmt_number(s[\"cache_read\"]):>10} {fmt_cost(s[\"cost_usd\"]):>10} {fmt_duration(s[\"duration_ms\"]):>10} {s[\"turns\"]:>7}')
+
+    print()
+
+def print_csv(summaries):
+    print('group,sessions,input_tokens,output_tokens,cache_creation,cache_read,cost_usd,duration_ms,turns,errors')
+    for s in summaries:
+        label = s['label'] or 'total'
+        print(f'{label},{s[\"sessions\"]},{s[\"input_tokens\"]},{s[\"output_tokens\"]},{s[\"cache_creation\"]},{s[\"cache_read\"]},{s[\"cost_usd\"]:.6f},{s[\"duration_ms\"]},{s[\"turns\"]},{s[\"errors\"]}')
+
+def print_json(summaries):
+    print(json.dumps(summaries, indent=2))
+
+# Compute summaries
+summaries = []
+
+if group_by:
+    groups = defaultdict(list)
+    for r in records:
+        if group_by == 'tag':
+            key = r.get('tag', '') or '(no tag)'
+        elif group_by == 'day':
+            ts = r.get('timestamp', '')
+            key = ts[:10] if len(ts) >= 10 else '(unknown)'
+        elif group_by == 'model':
+            key = r.get('model', 'unknown')
+        else:
+            key = '(all)'
+        groups[key].append(r)
+
+    for key in sorted(groups.keys()):
+        summaries.append(summarize(groups[key], label=key))
+
+    # Grand total
+    summaries.append(summarize(records, label='TOTAL'))
+else:
+    summaries.append(summarize(records, label='all'))
+
+# Output
+if fmt == 'table':
+    # Header info
+    first_ts = min(r.get('timestamp', '') for r in records)
+    last_ts = max(r.get('timestamp', '') for r in records)
+    total = summaries[-1]
+    print()
+    print(f'  \033[1mToken Usage Report\033[0m')
+    print(f'  \033[2mPeriod: {first_ts[:19]} → {last_ts[:19]}\033[0m')
+    if tag_filter:
+        print(f'  \033[2mFilter: tag=\"{tag_filter}\"\033[0m')
+    if parse_errors:
+        print(f'  \033[1;33m{parse_errors} unparseable lines skipped\033[0m')
+
+    print_table(summaries)
+
+    # Summary footer
+    t = summaries[-1]
+    print(f'  \033[1mTotal cost:\033[0m      {fmt_cost(t[\"cost_usd\"])}')
+    print(f'  \033[1mTotal tokens:\033[0m    {fmt_number(t[\"total_tokens\"])} ({fmt_number(t[\"input_tokens\"])} in + {fmt_number(t[\"output_tokens\"])} out)')
+    print(f'  \033[1mCache savings:\033[0m   {fmt_number(t[\"cache_read\"])} tokens read from cache')
+    print(f'  \033[1mAvg per session:\033[0m {fmt_number(t[\"avg_tokens_per_session\"])} tokens, {fmt_cost(t[\"avg_cost_per_session\"])}')
+    print(f'  \033[1mTotal duration:\033[0m  {fmt_duration(t[\"duration_ms\"])}')
+    print()
+elif fmt == 'csv':
+    print_csv(summaries)
+elif fmt == 'json':
+    print_json(summaries)
+else:
+    print(f'Unknown format: {fmt}', file=sys.stderr)
+    sys.exit(1)
+" 2>/dev/null
+
+if [[ $? -ne 0 ]]; then
+    echo "ERROR: Failed to parse JSONL data" >&2
+    exit 1
+fi
